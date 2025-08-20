@@ -39,6 +39,8 @@ class ModelArgs:
     norm_eps: float = 1e-5
     max_seq_len: int = 10368 # block size
     dropout: float = 0.0
+    sig_dim: int = 0
+    use_signatures: bool = False
 
 
 class RMSNorm(torch.nn.Module):
@@ -327,6 +329,8 @@ class Transformer(nn.Module):
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
+        self.use_signatures = params.use_signatures and params.sig_dim > 0
+        self.sig_dim = params.sig_dim
 
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.dropout = nn.Dropout(params.dropout)
@@ -335,6 +339,10 @@ class Transformer(nn.Module):
             self.layers.append(TransformerBlock(layer_id, params))
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+        if self.use_signatures:
+            self.sig_proj = nn.Linear(self.sig_dim, params.dim, bias=False)
+        else:
+            self.sig_proj = None
 
         # share the unembedding parameters with the embedding parameters
         self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
@@ -376,6 +384,7 @@ class Transformer(nn.Module):
     def forward(
         self,
         tokens: torch.Tensor,
+        sigs: Optional[torch.Tensor] = None,
         targets: Optional[torch.Tensor] = None,
         kv_cache: bool = False,
         max_seq_length: int = None,
@@ -384,6 +393,8 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
+        if self.use_signatures and sigs is not None:
+            h = h + self.sig_proj(sigs)
         h = self.dropout(h)
         if kv_cache:
             freqs_cos = self.freqs_cos[input_pos:input_pos+seqlen]
