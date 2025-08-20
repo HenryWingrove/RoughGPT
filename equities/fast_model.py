@@ -39,6 +39,8 @@ class ModelArgs:
     norm_eps: float = 1e-5
     max_seq_len: int = 10368 # block size
     dropout: float = 0.0
+    sig_dim: int = 0
+    use_signatures: bool = False
 
 
 class RMSNorm(torch.nn.Module):
@@ -329,6 +331,10 @@ class Transformer(nn.Module):
         self.n_layers = params.n_layers
 
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+        if params.use_signatures:
+            self.sig_proj = nn.Linear(params.sig_dim, params.dim)
+        else:
+            self.sig_proj = None
         self.dropout = nn.Dropout(params.dropout)
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
@@ -381,9 +387,16 @@ class Transformer(nn.Module):
         max_seq_length: int = None,
         input_pos: torch.Tensor = None,
         roll: bool = False,
+        sigs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
+        tok_emb = self.tok_embeddings(tokens)
+        if self.params.use_signatures:
+            if sigs is None:
+                raise ValueError("sigs must be provided when use_signatures is True")
+            h = tok_emb + self.sig_proj(sigs)
+        else:
+            h = tok_emb
         h = self.dropout(h)
         if kv_cache:
             freqs_cos = self.freqs_cos[input_pos:input_pos+seqlen]
