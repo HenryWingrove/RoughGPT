@@ -42,6 +42,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from data_processing.itch_encoding import Vocab, encode_msgs
 from fast_model import Transformer, ModelArgs
 
+# additional training options
+use_signatures = False
+sig_dim = 0
+if "--use-signatures" in sys.argv:
+    use_signatures = True
+    sys.argv.remove("--use-signatures")
+
 # -----------------------------------------------------------------------------
 # config values from best sweep run
 # I/O
@@ -184,7 +191,7 @@ if use_sink:
     assert vocab.SINK_TOK == 1
     # assert max_seq_len == 10368
 # poor man's data loader
-def get_batch(split):
+def get_batch_raw(split):
     # data = train_data if split == 'train' else val_data
     datasets = train_datasets if split == 'train' else val_datasets
     data = rng.choice(datasets)
@@ -223,6 +230,24 @@ def get_batch(split):
         x, y = x.to(device), y.to(device)
     return x, y
 
+if use_signatures:
+    from equities.signature_dataset import SignatureDataset
+
+    signature_dataset = SignatureDataset(get_batch_raw, sig_dim=sig_dim)
+    sig_dim = signature_dataset.sig_dim
+    config["sig_dim"] = sig_dim
+    config["use_signatures"] = use_signatures
+
+    def get_batch(split):
+        tokens, sigs, targets = signature_dataset.get_batch(split)
+        return tokens, sigs, targets
+else:
+    def get_batch(split):
+        tokens, targets = get_batch_raw(split)
+        return tokens, None, targets
+    config["sig_dim"] = sig_dim
+    config["use_signatures"] = use_signatures
+
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
@@ -237,6 +262,8 @@ model_args = dict(
     multiple_of=multiple_of,
     max_seq_len=max_seq_len,
     dropout=dropout,
+    sig_dim=sig_dim,
+    use_signatures=use_signatures,
 )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
@@ -251,8 +278,9 @@ elif init_from == "resume":
     checkpoint_model_args = checkpoint["model_args"]
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len"]:
-        model_args[k] = checkpoint_model_args[k]
+    for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len", "sig_dim", "use_signatures"]:
+        if k in checkpoint_model_args:
+            model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = ModelArgs(**model_args)
     model = Transformer(gptconf)
@@ -274,8 +302,9 @@ elif init_from == "pretrained":
     checkpoint_model_args = checkpoint["model_args"]
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len"]:
-        model_args[k] = checkpoint_model_args[k]
+    for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len", "sig_dim", "use_signatures"]:
+        if k in checkpoint_model_args:
+            model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = ModelArgs(**model_args)
     model = Transformer(gptconf)
@@ -329,9 +358,9 @@ def estimate_loss():
     for split in ["train", "val"]:
         losses = torch.zeros(eval_iters)  # keep on CPU
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, sigs, Y = get_batch(split)
             with ctx:
-                logits = model(X, Y)
+                logits = model(X, sigs=sigs, targets=Y)
                 loss = raw_model.last_loss
             losses[k] = loss.item()
         out[split] = losses.mean()
@@ -358,7 +387,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, sigs, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
@@ -415,11 +444,11 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
         with ctx:
-            logits = model(X, Y)
+            logits = model(X, sigs=sigs, targets=Y)
             loss = raw_model.last_loss
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        X, sigs, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
